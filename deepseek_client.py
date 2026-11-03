@@ -229,14 +229,24 @@ class DeepSeekClient:
 
         try:
             data = json.loads(content)
-            # 兼容 data 本身是数组或对象中带 files 字段
+            # 兼容 data 本身是数组
             if isinstance(data, list):
                 return data
+            
+            # 如果 AI 返回的是字典（带包装的），我们就自动把里面的列表找出来
             if isinstance(data, dict):
                 if "results" in data and isinstance(data["results"], list):
                     return data["results"]
                 if "files" in data and isinstance(data["files"], list):
                     return data["files"]
+                if "value" in data and isinstance(data["value"], list):
+                    return data["value"]
+                
+                # 终极防御：不管 AI 套了什么壳（不管是 type 还是 data 还是啥），
+                # 只要字典里有一个值是列表，并且列表里都是我们需要的文件信息，就直接拿出来用
+                for key, val in data.items():
+                    if isinstance(val, list) and len(val) > 0 and isinstance(val[0], dict):
+                        return val
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"解析 DeepSeek 返回结果失败: {e}\n内容: {content}") from e
 

@@ -1255,13 +1255,29 @@ class FileOrganizerApp:
 
         try:
             client = DeepSeekClient()
-            raw_results = client.organize_files(
-                str(folder_path),
-                movable_files,
-                language=language,
-                mode=mode,
-                custom_instruction=custom_instruction or None,
-            )
+            raw_results = []
+            # 核心修改：分批处理，每批只发 30 个文件，防止 AI 回复过长被截断
+            batch_size = 30
+            total_batches = (len(movable_files) + batch_size - 1) // batch_size
+            
+            for i in range(0, len(movable_files), batch_size):
+                batch_files = movable_files[i:i+batch_size]
+                current_batch = i // batch_size + 1
+                
+                # 更新界面上的状态提示
+                self.root.after(0, lambda c=current_batch, t=total_batches: self.status_var.set(f"正在请求 AI 分析... 第 {c}/{t} 批（每批30个文件）"))
+                
+                # 请求这一小批文件
+                batch_results = client.organize_files(
+                    str(folder_path),
+                    batch_files,
+                    language=language,
+                    mode=mode,
+                    custom_instruction=custom_instruction or None,
+                )
+                # 将结果拼接到总结果中
+                raw_results.extend(batch_results)
+                
         except Exception as e:  # noqa: BLE001
             self.root.after(
                 0,
