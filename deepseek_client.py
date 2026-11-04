@@ -53,23 +53,24 @@ class DeepSeekClient:
 
     def __init__(
         self,
+        use_local: bool = False,  # 新增：是否使用本地模型
         api_key: str | None = None,
         base_url: str = "https://api.deepseek.com",
         model: str = "deepseek-chat",
     ) -> None:
-        # 优先使用显式传入的 api_key，其次是环境变量，最后是本地文件
-        api_key = api_key or os.getenv("DEEPSEEK_API_KEY") or _load_api_key_from_file()
-        if not api_key:
-            raise RuntimeError(
-                "未找到 DeepSeek API Key。\n"
-                "你可以使用以下任一方式配置：\n"
-                "1. 设置环境变量 DEEPSEEK_API_KEY\n"
-                "2. 在环境变量 DEEPSEEK_API_KEY_FILE 中指定存放 key 的文件路径\n"
-                "3. 在本项目目录或 deepseek_client.py 同目录下创建 deepseek_api_key.txt，"
-                "   将你的 API Key 写在第一行"
-            )
+        
+        # 如果选择了本地模型，自动覆盖地址和模型名
+        if use_local:
+            base_url = "http://localhost:11434/v1"
+            model = "deepseek-r1:7b"
+            api_key = "ollama" # 本地不需要验证，随便填一个防止报错
+        else:
+            # 云端模型的逻辑保持不变
+            api_key = api_key or os.getenv("DEEPSEEK_API_KEY") or _load_api_key_from_file()
+            if not api_key:
+                raise RuntimeError("未找到 DeepSeek API Key，请在云端模式下配置。")
 
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=300.0)
         self.model = model
 
     def organize_files(
@@ -108,34 +109,22 @@ class DeepSeekClient:
         if not files_info:
             return []
 
-        # 系统基础提示词
+        # 系统基础提示词（极度精简版，去掉 reason，强制字典格式）
         if language == "en":
             system_prompt = (
                 "You are an intelligent folder organizing assistant. "
-                "Given a folder, you will suggest a subfolder name for each file "
-                "based on its filename, extension and small content samples. "
-                "Requirements:\n"
-                "1. Output MUST be a pure JSON array, no extra text.\n"
-                "2. The output array length MUST equal the input files list length, "
-                "   and each element corresponds to the file at the same index.\n"
-                "3. Each element must have: name, suggested_subfolder, reason.\n"
-                "4. suggested_subfolder is a relative folder name only "
-                "(e.g. 'Images', 'Documents/PDF'), no absolute paths.\n"
-                "5. If unsure, set suggested_subfolder to 'Others'.\n"
-                "6. All suggested_subfolder names MUST be in English.\n"
+                "Output MUST be a JSON object containing a key 'files' which is an array. "
+                "Example format: {\"files\": [{\"name\": \"xxx.txt\", \"suggested_subfolder\": \"Documents\"}]}. "
+                "The array length MUST equal the input files list length. "
+                "All suggested_subfolder names MUST be in English."
             )
         else:
             system_prompt = (
                 "你是一个智能文件夹整理助手。"
-                "现在有一个文件夹需要整理，你会根据文件名、扩展名和少量内容样本，"
-                "为每个文件推荐一个合适的子文件夹名称，用于分类存放。"
-                "请注意："
-                "1. 你的输出必须是严格的 JSON 数组，不要包含任何额外文字。"
-                "2. 输出数组的长度必须与输入的 files 列表长度完全一致，顺序也必须一一对应。"
-                "3. 每个元素包含: name, suggested_subfolder, reason 三个字段。"
-                "4. suggested_subfolder 只返回相对文件夹名，例如 '图片'、'文档/PDF'，不要包含绝对路径。"
-                "5. 如果无法判断，可以将 suggested_subfolder 设为 '其他'。"
-                "6. 所有 suggested_subfolder 必须使用简体中文名称。"
+                "输出必须是一个 JSON 对象，且包含一个名为 'files' 的键，它的值是一个数组。"
+                "示例格式：{\"files\": [{\"name\": \"xxx.txt\", \"suggested_subfolder\": \"文档\"}]}。"
+                "数组长度必须与输入列表完全一致。"
+                "所有 suggested_subfolder 必须使用简体中文名称。"
             )
 
         # 根据模式追加整理风格
@@ -220,35 +209,37 @@ class DeepSeekClient:
                     "content": base_user_content,
                 },
             ],
-            response_format={"type": "json_object"},
         )
 
         content = resp.choices[0].message.content
-        # response_format=json_object 时，content 应为 JSON 字符串。
-        import json
+        
+        # 新增：清理 AI 返回内容里的 Markdown 格式符（脱马甲）
+        content_clean = content.strip()
+        if content_clean.startswith("```json"):
+            content_clean = content_clean[7:]
+        elif content_clean.startswith("```"):
+            content_clean = content_clean[3:]
+        
+        if content_clean.endswith("```"):
+            content_clean = content_clean[:-3]
+            
+        content_clean = content_clean.strip()
 
+        import json
         try:
-            data = json.loads(content)
-            # 兼容 data 本身是数组
+            # 用清理过后的数据去解析
+            data = json.loads(content_clean)
             if isinstance(data, list):
                 return data
-            
-            # 如果 AI 返回的是字典（带包装的），我们就自动把里面的列表找出来
             if isinstance(data, dict):
-                if "results" in data and isinstance(data["results"], list):
-                    return data["results"]
-                if "files" in data and isinstance(data["files"], list):
-                    return data["files"]
-                if "value" in data and isinstance(data["value"], list):
-                    return data["value"]
-                
-                # 终极防御：不管 AI 套了什么壳（不管是 type 还是 data 还是啥），
-                # 只要字典里有一个值是列表，并且列表里都是我们需要的文件信息，就直接拿出来用
+                for key in ["files", "results", "value", "data"]:
+                    if key in data and isinstance(data[key], list):
+                        return data[key]
                 for key, val in data.items():
                     if isinstance(val, list) and len(val) > 0 and isinstance(val[0], dict):
                         return val
+                return []
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"解析 DeepSeek 返回结果失败: {e}\n内容: {content}") from e
 
         raise RuntimeError(f"DeepSeek 返回了无法识别的结构: {content}")
-
